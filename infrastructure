@@ -1,0 +1,167 @@
+diff --git a/infrastructure/__init__.py b/infrastructure/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..94e734cb1b5343a51c9bcc132890bb00bff09da1
+--- /dev/null
++++ b/infrastructure/__init__.py
+@@ -0,0 +1,161 @@
++"""Infrastructure management utilities for the PA + RL trading bot."""
++from __future__ import annotations
++
++import json
++import threading
++import time
++from pathlib import Path
++from typing import Any, Dict, Optional
++
++
++class InfrastructureError(RuntimeError):
++    """Custom error used when the infrastructure layer fails."""
++
++
++class InfrastructureManager:
++    """Handle runtime infrastructure concerns for the trading bot.
++
++    The class is intentionally lightweight and synchronous so it can operate in
++    the limited execution environment that backs the project.  It is in charge
++    of:
++
++    * ensuring on-disk directories exist
++    * keeping a minimal runtime state file that can be used for debugging
++    * providing helper hooks for dashboard updates and notifications
++    """
++
++    DASHBOARD_FILE = "dashboard.json"
++
++    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
++        self.config = config or {}
++        self.bot_config = self.config.get("bot", {})
++        self.data_dir = Path(self.config.get("data_dir", "state"))
++        self.database_path = Path(self.config.get("database_path", "data/trades.db"))
++        self.dashboard_path = self.data_dir / self.DASHBOARD_FILE
++        self.backup_dir = self.data_dir / "backups"
++        self.log_dir = self.data_dir / "logs"
++        self._lock = threading.Lock()
++        self._started = False
++        self._start_time: Optional[float] = None
++        self._last_dashboard_update: Optional[float] = None
++        self._notification_history: list[dict[str, Any]] = []
++
++        self._initialise_directories()
++        self._write_initial_state()
++
++    # ------------------------------------------------------------------
++    # Lifecycle
++    # ------------------------------------------------------------------
++    def start_all(self) -> None:
++        """Mark the infrastructure layer as started.
++
++        The project currently does not have long running services such as
++        database connections or websocket clients.  The method still validates
++        that the directory layout is present so callers can rely on it.
++        """
++
++        with self._lock:
++            if self._started:
++                return
++
++            self._initialise_directories()
++            self._start_time = time.time()
++            self._started = True
++            self._write_state({"status": "running", "started_at": self._start_time})
++
++    def stop_all(self) -> None:
++        """Stop the infrastructure layer and persist the shutdown time."""
++
++        with self._lock:
++            if not self._started:
++                return
++
++            shutdown_time = time.time()
++            self._write_state(
++                {
++                    "status": "stopped",
++                    "started_at": self._start_time,
++                    "stopped_at": shutdown_time,
++                }
++            )
++            self._started = False
++            self._start_time = None
++
++    # ------------------------------------------------------------------
++    # Dashboard & notifications
++    # ------------------------------------------------------------------
++    def update_dashboard(self, extra: Optional[Dict[str, Any]] = None) -> None:
++        """Persist a lightweight dashboard file.
++
++        Parameters
++        ----------
++        extra:
++            Optional data to merge into the dashboard payload.  Callers can pass
++            dictionaries to expose runtime metrics.
++        """
++
++        payload: Dict[str, Any] = {
++            "bot_name": self.bot_config.get("name", "Trading Bot"),
++            "bot_version": self.bot_config.get("version", "1.0.0"),
++            "mode": self.config.get("mode", "live"),
++            "timestamp": time.time(),
++            "uptime": (time.time() - self._start_time) if self._start_time else None,
++        }
++
++        if extra:
++            payload.update(extra)
++
++        with self._lock:
++            self._last_dashboard_update = payload["timestamp"]
++            self._write_json(self.dashboard_path, payload)
++
++    def send_notification(self, level: str, message: str) -> None:
++        """Record a notification to the history and echo it to stdout."""
++
++        notification = {
++            "level": level,
++            "message": message,
++            "timestamp": time.time(),
++        }
++
++        with self._lock:
++            self._notification_history.append(notification)
++            print(f"[Notification][{level.upper()}] {message}")
++            self._write_state({"last_notification": notification})
++
++    # ------------------------------------------------------------------
++    # Helpers
++    # ------------------------------------------------------------------
++    def _initialise_directories(self) -> None:
++        """Create the directory structure declared in the configuration."""
++
++        for directory in (self.data_dir, self.backup_dir, self.log_dir, self.database_path.parent):
++            try:
++                directory.mkdir(parents=True, exist_ok=True)
++            except OSError as exc:  # pragma: no cover - defensive programming
++                raise InfrastructureError(f"Unable to create directory: {directory}") from exc
++
++    def _write_initial_state(self) -> None:
++        """Persist an initial state snapshot on initialisation."""
++
++        self._write_state({"status": "initialised", "timestamp": time.time()})
++
++    def _write_state(self, state: Dict[str, Any]) -> None:
++        path = self.data_dir / "state.json"
++        payload = {
++            "bot": self.bot_config,
++            "state": state,
++            "last_dashboard_update": self._last_dashboard_update,
++            "notifications": self._notification_history[-10:],
++        }
++        self._write_json(path, payload)
++
++    def _write_json(self, path: Path, payload: Dict[str, Any]) -> None:
++        try:
++            with path.open("w", encoding="utf-8") as handle:
++                json.dump(payload, handle, ensure_ascii=False, indent=2)
++        except OSError as exc:  # pragma: no cover - defensive programming
++            raise InfrastructureError(f"Unable to persist JSON file: {path}") from exc
++
++
++__all__ = ["InfrastructureManager", "InfrastructureError"]
